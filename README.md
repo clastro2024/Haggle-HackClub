@@ -4,11 +4,12 @@ This is my try with the [Haggle Competition by HackClub](https://haggle.hackclub
 
 **Currently:** _Week 1_
 
-**Note:** This is my first ever actual HackClub competition participation and using Hackatime and also really wanted to get a submission as fast as possible, so the code and structuring are not really the highest quality right now :/
+**Note:** This is my first ever actual HackClub competition participation and using Hackatime and also really wanted to get a submission as fast as possible, so the code and structuring are not really the highest quality right now :/ Soooo, please better not "haggle" over this
 
 ## Repository
 
-- `predict.py` -
+- `predict.py` - Main Entrypoint
+- `/archives` - n0t 10st medi4 f0r sure
 - `/Week 1` - Week 1 Files:
   - `/Week 1/main.ipynb` - Main full organized pipeline
   - `/Week 1/proto.ipynb` - Just prototyping and slacking code
