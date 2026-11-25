@@ -6,8 +6,8 @@ from sklearn.preprocessing import OneHotEncoder
 from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import root_mean_squared_log_error
 
-a = pd.read_csv("./archives/train.csv")
-test = pd.read_csv("./archives/test.csv")
+a = pd.read_csv("./train.csv")
+test = pd.read_csv("./test.csv")
 
 b = a.drop(columns=["project_id", "hours_spent", "log_hours", "hours_bucket"])
 c = a[["hours_spent", "log_hours", "hours_bucket"]]
