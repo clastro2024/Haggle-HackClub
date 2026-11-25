@@ -94,7 +94,7 @@ pred = forest.predict(test_final.drop(columns=["project_id"]))
 
 result_df = pd.DataFrame({
     'project_id': test['project_id'],
-    'prediction': pred,
+    'hours_spent': pred,
 })
 
 result_df.to_csv('predictions.csv', index=False)
