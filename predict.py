@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import joblib
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.model_selection import GridSearchCV
@@ -39,29 +40,10 @@ b_ohe = ohe.fit_transform(b[text_cols])
 # 4. Rejoin encoded text columns with numeric columns
 b_final = pd.concat([b[num_cols], b_ohe], axis=1)
 
-# 1. Define the parameter grid
-param_grid = {
-    "n_estimators": [50, 100, 200],
-    "max_depth": [3, 5, 7, 10, 12],
-    "min_samples_leaf": [5, 10, 20, 50],
-    "min_samples_split": [10, 20, 50],
-}
+# forest = RandomForestRegressor(max_depth=12, min_samples_leaf=10, min_samples_split=10, n_estimators=200)
+# forest.fit(b_final, c["hours_spent"])
 
-# 2. Run 5-fold cross-validation
-# grid = GridSearchCV(
-#     estimator=RandomForestRegressor(random_state=42),
-#     param_grid=param_grid,
-#     cv=5,
-#     scoring="neg_root_mean_squared_log_error",  # or "r2" / "neg_mean_absolute_error"
-#     n_jobs=-1
-# )
-
-# grid.fit(b_final, c["hours_spent"])
-
-# best_tree = grid.best_estimator_
-
-forest = RandomForestRegressor(max_depth=12, min_samples_leaf=10, min_samples_split=10, n_estimators=200)
-forest.fit(b_final, c["hours_spent"])
+forest = joblib.load("best_tree.pkl")
 
 
 bounds = test["author_account_age_years"].str.extract(r"^\s*(<=|>=|<|>)?\s*(\d+\.?\d*)\s*(?:-\s*(\d+\.?\d*))?\s*\+?\s*$")
