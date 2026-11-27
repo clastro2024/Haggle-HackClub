@@ -1,13 +1,21 @@
-"""Train on train.csv and write Week 1 hour predictions for test.csv."""
+"""Train the Week 1 project-hour model and write predictions.csv in the current directory.
+
+All supervised fits use train.csv. Models share information across project types,
+then specialize using the project's category, hosting, and patterns of development.
+The final weights operate on log1p(hours); only the CSV writer converts back to hours.
+"""
+
+from copy import deepcopy
 
 import numpy as np
 import pandas as pd
-from scipy.linalg import solve
+from scipy.linalg import cho_factor, cho_solve, solve, solve_triangular
 from scipy.spatial.distance import cdist
 from scipy.special import expit
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
+from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import OneHotEncoder, SplineTransformer, StandardScaler
 from threadpoolctl import threadpool_limits
 
@@ -128,7 +136,7 @@ def normalize_block(train, test):
     return train / scale, (test - center) / scale
 
 
-def kernel_ridge(target, test_size, kernel_block, penalty):
+def kernel_ridge(target, test_size, kernel_block, penalty, center=True):
     # Block construction and an in-place Cholesky solve keep the full 4,500-row
     # fit to a single float32 training matrix plus a small working block.
     count = len(target)
@@ -137,25 +145,15 @@ def kernel_ridge(target, test_size, kernel_block, penalty):
         rows = slice(start, start + 128)
         gram[rows] = kernel_block(rows, False)
     gram.flat[::count + 1] += penalty
-    centered = (target - target.mean()).astype(np.float32)
+    mean = target.mean() if center else 0.0
+    centered = (target - mean).astype(np.float32)
     dual = solve(gram, centered, assume_a="pos", overwrite_a=True)
     del gram
     predicted = np.empty(test_size)
     for start in range(0, test_size, 128):
         rows = slice(start, start + 128)
-        predicted[rows] = target.mean() + kernel_block(rows, True) @ dual
+        predicted[rows] = mean + kernel_block(rows, True) @ dual
     return predicted, dual
-
-
-def predict_interactions(num_train, num_test, cat_train, cat_test, target):
-    nums, nums_test = normalize_block(*numeric_basis(num_train, num_test))
-    cats, cats_test = normalize_block(cat_train, cat_test)
-    def kernel(rows, testing):
-        n = (nums_test if testing else nums)[rows] @ nums.T
-        c = (cats_test if testing else cats)[rows] @ cats.T
-        return 2 * n + c + 0.8 * n * c + 0.3 * n**2 + 0.15 * c**2 + 1
-    predicted, _ = kernel_ridge(target, len(num_test), kernel, penalty=4)
-    return predicted
 
 
 def predict_similarity(num_train, num_test, cat_train, cat_test, num_categories, target):
@@ -171,21 +169,8 @@ def predict_similarity(num_train, num_test, cat_train, cat_test, num_categories,
         radius = cdist((test if testing else train)[rows], train)
         return (1 + radius) * np.exp(-radius)
 
-    first, dual = kernel_ridge(target, len(test), kernel, penalty=0.1)
-    # Learn a distance metric from the first fit's gradients. Keep a diagonal
-    # component so weak directions still contribute to the second fit.
-    gradients = np.empty_like(train)
-    for start in range(0, len(train), 128):
-        rows = slice(start, start + 128)
-        weights = np.exp(-cdist(train[rows], train)) * dual
-        gradients[rows] = weights @ train - weights.sum(axis=1)[:, None] * train[rows]
-    values, directions = np.linalg.eigh(gradients.T @ gradients / len(train))
-    strength = np.sqrt(values.clip(min=0))
-    normalizer = max(1e-10, np.var(train @ directions, axis=0) @ strength)
-    transform = directions * np.sqrt(strength / normalizer + 0.12)
-    train, test = train @ transform, test @ transform
-    second, _ = kernel_ridge(target, len(test), kernel, penalty=0.1)
-    return first, second
+    prediction, _ = kernel_ridge(target, len(test), kernel, penalty=0.1)
+    return prediction
 
 
 def predict_global(train, test, numeric, categorical, target):
@@ -222,30 +207,250 @@ def predict_global(train, test, numeric, categorical, target):
     return 0.325 * boosted + 0.325 * smooth + 0.35 * similar
 
 
+# Separate estimates let the final regressor distinguish a large initial upload
+# from sustained development, or a small codebase from an asset-heavy game.
+FEATURE_VIEWS = (
+    ("active_commit_days", "project_span_days", "num_commits", "num_commit_authors",
+     "pct_commits_late_night", "pct_commits_weekend", "pct_generic_commit_msgs",
+     "avg_commit_msg_length", "num_merge_commits", "num_branches", "num_pull_requests",
+     "commit_cadence", "active_share", "active_per_person"),
+    ("lines_of_code", "num_source_files", "num_directories", "num_languages",
+     "pct_primary_language", "num_dependencies", "max_dir_depth", "avg_file_length",
+     "has_tests", "has_backend", "has_database", "primary_language", "framework", "comment_line_ratio"),
+    ("churn_ratio", "lines_added_total", "lines_deleted_total", "pct_code_in_first_commit",
+     "median_lines_per_commit", "max_lines_in_one_commit", "nonmerge_commits", "edits_per_author",
+     "edits_per_day", "typical_edited", "outside_largest", "edited_to_source"),
+    ("readme_word_count", "description_word_count", "readme_num_headings", "readme_num_images",
+     "readme_num_code_blocks", "has_license", "has_docs_folder", "readme_has_install_instructions",
+     "stars", "num_issues", "num_releases"),
+    ("asset_size_mb", "num_image_files", "num_audio_files", "num_3d_model_files", "num_font_files",
+     "project_category", "is_multiplayer", "has_custom_art", "uses_game_engine", "framework"),
+    ("hosting_type", "url_is_live", "load_time_ms", "page_weight_kb", "num_js_files_loaded",
+     "num_internal_pages", "has_custom_domain", "is_mobile_responsive", "author_prior_projects",
+     "author_account_age_years", "is_clone_or_tutorial", "is_forked_from_template"),
+)
+
+
+def specialist_features(frame):
+    x = frame.copy()
+    x["span_surplus"] = x["active_commit_days"] - x["project_span_days"]
+    x["typical_vs_biggest"] = x["median_lines_per_commit"] / (1 + x["max_lines_in_one_commit"])
+    x["rewriting"] = np.log1p(x["edits"]) - np.log1p(x["precise_loc"])
+    authors = x["num_commit_authors"].clip(lower=1)
+    for power in (0.5, 1):
+        contributors = authors**power
+        for name, column in (("active", "active_commit_days"), ("loc", "precise_loc"), ("change", "edits")):
+            x[f"{name}_equiv{power}"] = x[column] / contributors
+    after_first = 1 - x["pct_code_in_first_commit"]
+    x["returned_after_upload"] = x["active_commit_days"] * after_first
+    x["nontrivial_commits"] = x["specific_messages"] * after_first
+    x["remaining_lines"] = x["lines_added_total"] * after_first
+    x["sampled_avg"] = x["edits"] / (1 + x["num_commits"])
+    x["median_ratio"] = x["median_lines_per_commit"] / (1 + x["sampled_avg"])
+    x["noncomment_lines"] = x["precise_loc"] * (1 - x["comment_line_ratio"])
+    x["secondary_code"] = x["precise_loc"] * (1 - x["pct_primary_language"])
+    x["readme_length_per_description"] = np.log1p(x["readme_word_count"]) - np.log1p(x["description_word_count"])
+    x["authored_asset_ratio"] = np.log1p(x["asset_count"]) - np.log1p(x["num_source_files"])
+    return x
+
+
+def project_segment(frame):
+    kind = frame["project_category"].fillna("other").to_numpy(dtype=str)
+    host = frame["hosting_type"].fillna("other").to_numpy(dtype=str)
+    static_site = (kind == "website") & np.isin(host, ["github-pages", "netlify"])
+    return np.select(
+        [host == "itch", kind == "game", static_site, kind == "website", kind == "app", kind == "tool"],
+        ["itch", "game", "static", "web", "app", "tool"], default="other",
+    )
+
+
+def view_inputs(train, test):
+    numeric = train.select_dtypes(include=np.number).columns
+    cats = train.columns.difference(numeric)
+    left, right = normalize_block(*numeric_basis(train[numeric], test[numeric]))
+    if not len(cats):
+        return left, right
+    encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    a = encoder.fit_transform(train[cats].astype("string").fillna("?"))
+    b = encoder.transform(test[cats].astype("string").fillna("?"))
+    a, b = normalize_block(a, b)
+    return np.column_stack([left, a]), np.column_stack([right, b])
+
+
+def project_estimates(train, test, target, recording):
+    responses = np.column_stack([
+        target, np.eye(3)[recording], target > np.log1p(8), target > np.log1p(25),
+        np.minimum(target, np.log1p(12)),
+    ])
+    train_predictions, test_predictions = [], []
+    for columns in (*FEATURE_VIEWS, train.columns):
+        a, b = view_inputs(train[list(columns)], test[list(columns)])
+        a = np.column_stack([np.ones(len(a)), a])
+        b = np.column_stack([np.ones(len(b)), b])
+        gram = a.T @ a
+        gram.flat[::len(gram) + 1] += 1.6
+        chol = cho_factor(gram, lower=True)
+        coef = cho_solve(chol, a.T @ responses)
+        # Remove each row's own label from its fitted value before a second model
+        # sees it. The ridge hat diagonal gives the leave-one-out adjustment.
+        leverage = np.square(solve_triangular(chol[0], a.T, lower=True)).sum(axis=0)
+        keep = np.maximum(1 - leverage, 1e-7)[:, None]
+        train_predictions.append(responses + (a @ coef - responses) / keep)
+        test_predictions.append(b @ coef)
+    return np.column_stack(train_predictions), np.column_stack(test_predictions)
+
+
+def estimate_kernel(train, test, train_group, test_group, target, shared_train, shared_test):
+    scaler = StandardScaler()
+    a = scaler.fit_transform(train).clip(-4, 4)
+    b = scaler.transform(test).clip(-4, 4)
+
+    def kernel(rows, testing):
+        query = (b if testing else a)[rows]
+        group = (test_group if testing else train_group)[rows]
+        radius = cdist(query, a) / np.sqrt(a.shape[1])
+        same = group[:, None] == train_group[None, :]
+        return (1 + radius) * np.exp(-radius) * (1 + 0.65 * same) + 0.12 * (query @ a.T) / a.shape[1]
+
+    # The full-view estimate already supplies an intercept. Fit the residual
+    # directly, retaining its mean in the training solve.
+    residual = target - shared_train
+    correction, _ = kernel_ridge(residual, len(test), kernel, penalty=0.4, center=False)
+    return shared_test + correction
+
+
+def adapted_networks(train, test, target, recording, train_group, test_group):
+    numeric = train.select_dtypes(include=np.number).columns
+    cats = train.columns.difference(numeric)
+    a, b = normalize_block(*numeric_basis(train[numeric], test[numeric]))
+    encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    ca = encoder.fit_transform(train[cats].astype("string").fillna("?"))
+    cb = encoder.transform(test[cats].astype("string").fillna("?"))
+    a = np.column_stack([9 * a, ca]).astype(np.float32)
+    b = np.column_stack([9 * b, cb]).astype(np.float32)
+
+    centered = target - target.mean()
+    styles = np.eye(3)[recording]
+    labels = np.column_stack([centered, styles, styles * centered[:, None],
+                              target[:, None] > np.log1p([4, 15, 40])])
+    means = labels.mean(axis=0)
+    labels = (labels - means).astype(np.float32)
+
+    def estimate(net, inputs):
+        heads = net.predict(inputs) + means
+        return target.mean() + 0.65 * heads[:, 0] + 0.35 * heads[:, 4:7].sum(axis=1)
+
+    predictions = []
+    for seed in (51, 34, 76):
+        rng = np.random.default_rng(seed)
+
+        def masked(values):
+            return values * ((rng.random(values.shape) > 0.12) / 0.88).astype(np.float32)
+
+        shared = MLPRegressor(hidden_layer_sizes=(80, 32), alpha=1.0, learning_rate_init=0.001,
+                              batch_size=min(128, len(a)), random_state=seed)
+        for _ in range(32):
+            shared.partial_fit(masked(a), labels)
+        result = estimate(shared, b)
+        # Adapt independent copies. Replay other kinds of projects to regularize
+        # each specialist. Iterate training groups so predictions are batch invariant.
+        for group in np.unique(train_group):
+            own = np.flatnonzero(train_group == group)
+            other = np.flatnonzero(train_group != group)
+            if len(own) < 50 or not len(other):
+                continue
+            expert = deepcopy(shared)
+            expert.batch_size = min(expert.batch_size, len(own))
+            for _ in range(18):
+                sample = np.r_[own, rng.choice(other, len(own) // 3)]
+                expert.partial_fit(masked(a[sample]), labels[sample])
+            use = test_group == group
+            if np.any(use):
+                result[use] = estimate(expert, b[use])
+        predictions.append(result)
+    return np.mean(predictions, axis=0)
+
+
+def encoded_projects(train, test, categories):
+    encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    a = encoder.fit_transform(train[categories].astype("string").fillna("?"))
+    b = encoder.transform(test[categories].astype("string").fillna("?"))
+    return a, b
+
+
+def segment_boost(train, test, target, train_group, test_group):
+    options = dict(max_iter=165, max_leaf_nodes=9, learning_rate=0.045,
+                   l2_regularization=6, early_stopping=False, random_state=42)
+    predicted = np.empty(len(test))
+    global_model = None
+    for group in np.unique(test_group):
+        own = train_group == group
+        rows = test_group == group
+        if own.sum() >= 70:
+            model = HistGradientBoostingRegressor(**options).fit(train[own], target[own])
+        else:
+            if global_model is None:
+                global_model = HistGradientBoostingRegressor(**options).fit(train, target)
+            model = global_model
+        predicted[rows] = model.predict(test[rows])
+    return predicted
+
+
+def duration_hurdle(train, test, target, shared_train, shared_test):
+    """Predict the conditional mean on each side of 20 hours, then integrate over both."""
+    options = dict(max_iter=145, min_samples_leaf=22, max_leaf_nodes=9, learning_rate=0.045,
+                   l2_regularization=6, early_stopping=False, random_state=42)
+    long = target > np.log1p(20)
+    residual = target - shared_train
+    if long.all() or not long.any():
+        return shared_test + HistGradientBoostingRegressor(**options).fit(train, residual).predict(test)
+    gate = HistGradientBoostingClassifier(**options).fit(train, long)
+    probabilities = gate.predict_proba(test)
+    prediction = shared_test.copy()
+    for j, group in enumerate(gate.classes_):
+        selected = long == group
+        regressor = HistGradientBoostingRegressor(**options).fit(train[selected], residual[selected])
+        prediction += probabilities[:, j] * regressor.predict(test)
+    return prediction
+
+
 def predict_models(train, test, hours, log_hours=None):
     target = np.log1p(np.asarray(hours))
-    groups = recording_groups(np.asarray(log_hours) if log_hours is not None
-                              else np.log(np.maximum(hours, 1e-10)))
-    train, test = add_features(train), add_features(test)
-    numeric = train.select_dtypes(include=np.number).columns
-    categorical = [c for c in train if c not in numeric]
-    encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-    cat_train = encoder.fit_transform(train[categorical].astype("string").fillna("?"))
-    cat_test = encoder.transform(test[categorical].astype("string").fillna("?"))
-    num_train, num_test = train[numeric], test[numeric]
+    recorded = np.asarray(log_hours) if log_hours is not None else np.log(np.maximum(hours, 1e-10))
+    recording = recording_groups(recorded)
+    global_numeric = list(train.select_dtypes(include=np.number)) + [
+        "commits_per_day", "active_share", "added_after_first", "edits", "edits_per_author",
+        "edits_per_day", "nonmerge_commits", "asset_count",
+    ]
+    base, query = add_features(train), add_features(test)
+    numeric = base.select_dtypes(include=np.number).columns
+    cats = [c for c in base if c not in numeric]
+    a, b = encoded_projects(base, query, cats)
+    fa, fb = project_frequencies(base, query)
+    frequency = predict_experts(np.column_stack([base[numeric], fa, a]),
+                               np.column_stack([query[numeric], fb, b]), target, recording)
+    radial = predict_similarity(base[numeric], query[numeric], a, b, len(cats), target)
+    global_fit = predict_global(base, query, pd.Index(global_numeric), sorted(cats), target)
 
-    plain_train = np.column_stack([num_train, cat_train])
-    plain_test = np.column_stack([num_test, cat_test])
-    plain = predict_experts(plain_train, plain_test, target, groups)
-    freq_train, freq_test = project_frequencies(train, test)
-    frequent = predict_experts(np.column_stack([num_train, freq_train, cat_train]),
-                               np.column_stack([num_test, freq_test, cat_test]), target, groups)
-    interactions = predict_interactions(num_train, num_test, cat_train, cat_test, target)
-    first, adapted = predict_similarity(num_train, num_test, cat_train, cat_test, len(categorical), target)
-    specialists = 0.23 * plain + 0.23 * frequent + 0.34 * interactions + 0.09 * first + 0.11 * adapted
-    global_columns = train.loc[:, :"asset_count"].select_dtypes(include=np.number).columns
-    global_prediction = predict_global(train, test, global_columns, sorted(categorical), target)
-    return 0.5 * specialists + 0.5 * global_prediction
+    train_group, test_group = project_segment(base), project_segment(query)
+    a, b = encoded_projects(base, query, sorted(cats))
+    local = segment_boost(np.column_stack([base[numeric], a]), np.column_stack([query[numeric], b]),
+                          target, train_group, test_group)
+
+    projects, incoming = specialist_features(base), specialist_features(query)
+    estimates, predicted = project_estimates(projects, incoming, target, recording)
+    # Each view emits seven outputs. The first output in the last block is the
+    # all-features estimate of log1p(hours).
+    shared_train, shared_test = estimates[:, -7], predicted[:, -7]
+    similarity = estimate_kernel(estimates, predicted, train_group, test_group, target, shared_train, shared_test)
+    view_experts = predict_experts(estimates, predicted, target, recording)
+    full_numeric = projects.select_dtypes(include=np.number).columns
+    hurdle = duration_hurdle(np.column_stack([projects[full_numeric], a, estimates]),
+                             np.column_stack([incoming[full_numeric], b, predicted]),
+                             target, shared_train, shared_test)
+    networks = adapted_networks(projects, incoming, target, recording, train_group, test_group)
+    return (0.10 * global_fit + 0.09 * radial + 0.13 * frequency + 0.20 * similarity
+            + 0.17 * view_experts + 0.08 * local + 0.10 * hurdle + 0.13 * networks)
 
 
 def main():
