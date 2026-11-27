@@ -232,7 +232,7 @@ pred = forest.predict(test_final.drop(columns=["project_id"])[['pct_code_in_firs
 
 result_df = pd.DataFrame({
     'project_id': test['project_id'],
-    'hours_spent': pred,
+    'hours_spent': np.expm1(pred).clip(min=0),
 })
 
 result_df.to_csv('predictions.csv', index=False)
