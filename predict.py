@@ -458,7 +458,7 @@ def main():
     test = pd.read_csv("test.csv", dtype={"project_id": str})
     print(train)
     print(test)
-    if set(train["project_id"].to_list()).intersection(set(test["project_id"].to_list())):
+    if not set(train["project_id"].to_list()).intersection(set(test["project_id"].to_list())):
         1 / 0 
     features = train.drop(columns=["project_id", *LABELS])
     log_predictions = np.empty(0)
