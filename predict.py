@@ -456,8 +456,10 @@ def predict_models(train, test, hours, log_hours=None):
 def main():
     train = pd.read_csv("train.csv", dtype={"project_id": str})
     test = pd.read_csv("test.csv", dtype={"project_id": str})
+    print(train)
     print(test)
-    1 / 0 
+    if set(train["project_id"].to_list()).intersection(set(test["project_id"].to_list())):
+        1 / 0 
     features = train.drop(columns=["project_id", *LABELS])
     log_predictions = np.empty(0)
     if not test.empty:
